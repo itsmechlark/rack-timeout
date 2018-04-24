@@ -5,6 +5,8 @@ require_relative "support/scheduler"
 require_relative "support/timeout"
 require_relative "legacy"
 
+require 'addressable/uri'
+
 module Rack
   class Timeout
     include Rack::Timeout::MonotonicTime # gets us the #fsecs method
@@ -63,19 +65,23 @@ module Rack
       :service_timeout,   # How long the application can take to complete handling the request once it's passed down to it.
       :wait_timeout,      # How long the request is allowed to have waited before reaching rack. If exceeded, the request is 'expired', i.e. dropped entirely without being passed down to the application.
       :wait_overtime,     # Additional time over @wait_timeout for requests with a body, like POST requests. These may take longer to be received by the server before being passed down to the application, but should not be expired.
-      :service_past_wait  # when false, reduces the request's computed timeout from the service_timeout value if the complete request lifetime (wait + service) would have been longer than wait_timeout (+ wait_overtime when applicable). When true, always uses the service_timeout value. we default to false under the assumption that the router would drop a request that's not responded within wait_timeout, thus being there no point in servicing beyond seconds_service_left (see code further down) up until service_timeout.
-
-    def initialize(app, service_timeout:nil, wait_timeout:nil, wait_overtime:nil, service_past_wait:false)
+      :service_past_wait,  # when false, reduces the request's computed timeout from the service_timeout value if the complete request lifetime (wait + service) would have been longer than wait_timeout (+ wait_overtime when applicable). When true, always uses the service_timeout value. we default to false under the assumption that the router would drop a request that's not responded within wait_timeout, thus being there no point in servicing beyond seconds_service_left (see code further down) up until service_timeout.
+      :ignore,
+      :conditions
+    def initialize(app, service_timeout:nil, wait_timeout:nil, wait_overtime:nil, service_past_wait:false, ignore: [], allowed: [])
       @service_timeout   = read_timeout_property service_timeout, 15
       @wait_timeout      = read_timeout_property wait_timeout,    30
       @wait_overtime     = read_timeout_property wait_overtime,   60
       @service_past_wait = service_past_wait
+      @ignore = Array(ignore)
+      @conditions = Array(allowed)
       @app = app
     end
 
-
     RT = self # shorthand reference
     def call(env)
+      return @app.call(env) if ignored?(env) || !enabled?(env)
+
       info      = (env[ENV_INFO_KEY] ||= RequestDetails.new)
       info.id ||= env[HTTP_X_REQUEST_ID] || env[ACTION_DISPATCH_REQUEST_ID] || SecureRandom.uuid
 
@@ -187,10 +193,26 @@ module Rack
     end
 
     private
+
     # Sends out the notifications. Called internally at the end of `_set_state!`
     def self.notify_state_change_observers(env)
       @state_change_observers.values.each { |observer| observer.call(env) }
     end
 
+    def ignored?(env)
+      return false if ignore.empty?
+      request_uri = Addressable::URI.parse(Rack::Request.new(env).url)
+      ignore.include?(request_uri.path) || any_match?(ignore, request_uri.path)
+    end
+
+    def enabled?(env)
+      return true if conditions.empty?
+      request_uri = Addressable::URI.parse(Rack::Request.new(env).url)
+      conditions.include?(request_uri.path) || any_match?(conditions, request_uri.path)
+    end
+
+    def any_match?(patterns, string)
+      patterns.any? { |pattern| string[pattern] }
+    end
   end
 end
